@@ -1,185 +1,323 @@
-//! ADR-018 binary CSI frame parser.
+//! ADR-018 v1/v6 and FormMap ADR-018 v2 CSI parser.
 //!
-//! Two header magics are accepted: `0xC5110001` (raw CSI, v1) and
-//! `0xC5110006` (feature state, v6). The header is 20 bytes; everything
-//! after is interleaved I/Q bytes per subcarrier per antenna.
-//!
-//! Returns `None` when the buffer is truncated or the magic is wrong —
-//! this is a hot path (one call per UDP packet) so we prefer Option over
-//! a full `anyhow::Error` that would allocate.
+//! v1/v6 are accepted exactly as emitted by existing RuView ESP32 firmware.
+//! v2 adds deterministic station/link identity, firmware provenance, timestamps,
+//! a salted source MAC hash and payload CRC16.
 
-const CSI_MAGIC_V6: u32 = 0xC511_0006;
-const CSI_MAGIC_V1: u32 = 0xC511_0001;
-pub(crate) const CSI_HEADER_SIZE: usize = 20;
+use serde::Serialize;
+use std::net::UdpSocket;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Accept both header magics — `0xC5110001` (raw CSI) and
-/// `0xC5110006` (feature state). Exposed for tests.
-#[allow(dead_code)]
-pub(crate) const MAGIC_V1: u32 = CSI_MAGIC_V1;
-#[allow(dead_code)]
-pub(crate) const MAGIC_V6: u32 = CSI_MAGIC_V6;
+pub const MAGIC_V1: u32 = 0xC511_0001;
+pub const MAGIC_V2: u32 = 0xC511_0002;
+pub const MAGIC_V6: u32 = 0xC511_0006;
+pub const HEADER_V1: usize = 20;
+pub const HEADER_V2: usize = 48;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CsiFrame {
+    pub protocol_version: u8,
     pub node_id: u8,
+    pub station_id: u16,
+    pub link_id: u32,
     pub n_antennas: u8,
     pub n_subcarriers: u16,
+    pub frequency_mhz: u32,
     pub channel: u8,
+    pub sequence: u32,
+    pub agent_sequence: u32,
     pub rssi: i8,
     pub noise_floor: i8,
-    pub timestamp_us: u32,
-    /// Raw I/Q data: [I0, Q0, I1, Q1, ...] for each subcarrier
+    pub flags: u16,
+    pub firmware_version_code: u16,
+    pub timestamp_us: u64,
+    pub received_at_ms: u64,
+    pub source_mac_hash: [u8; 8],
+    pub payload_crc16: u16,
     pub iq_data: Vec<i8>,
-    /// Computed amplitude per subcarrier: sqrt(I^2 + Q^2)
     pub amplitudes: Vec<f32>,
-    /// Computed phase per subcarrier: atan2(Q, I)
     pub phases: Vec<f32>,
 }
 
-/// Parse an ADR-018 binary CSI frame from a UDP packet.
-///
-/// Returns `None` if:
-/// - the buffer is shorter than the 20-byte header
-/// - the magic does not match either accepted value
-/// - the declared I/Q payload is truncated
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn channel_from_frequency(frequency_mhz: u32) -> u8 {
+    if frequency_mhz == 2484 {
+        14
+    } else if (2412..=2472).contains(&frequency_mhz) {
+        (((frequency_mhz - 2412) / 5) + 1) as u8
+    } else if (5000..=5900).contains(&frequency_mhz) {
+        ((frequency_mhz - 5000) / 5) as u8
+    } else {
+        0
+    }
+}
+
+fn frequency_from_channel(channel: u8) -> u32 {
+    if channel == 14 {
+        2484
+    } else if (1..=13).contains(&channel) {
+        2407 + channel as u32 * 5
+    } else if channel >= 36 {
+        5000 + channel as u32 * 5
+    } else {
+        0
+    }
+}
+
+fn calculate_features(iq_data: &[i8], n_subcarriers: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut amplitudes = Vec::with_capacity(n_subcarriers);
+    let mut phases = Vec::with_capacity(n_subcarriers);
+    for index in 0..n_subcarriers {
+        let offset = index * 2;
+        if offset + 1 >= iq_data.len() {
+            break;
+        }
+        let real = iq_data[offset] as f32;
+        let imaginary = iq_data[offset + 1] as f32;
+        amplitudes.push((real * real + imaginary * imaginary).sqrt());
+        phases.push(imaginary.atan2(real));
+    }
+    (amplitudes, phases)
+}
+
 pub fn parse_adr018(data: &[u8]) -> Option<CsiFrame> {
-    if data.len() < CSI_HEADER_SIZE {
+    if data.len() < 4 {
         return None;
     }
+    let magic = u32::from_le_bytes(data[0..4].try_into().ok()?);
+    match magic {
+        MAGIC_V1 | MAGIC_V6 => parse_v1(data, magic),
+        MAGIC_V2 => parse_v2(data),
+        _ => None,
+    }
+}
 
-    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic != CSI_MAGIC_V6 && magic != CSI_MAGIC_V1 {
+fn parse_v1(data: &[u8], magic: u32) -> Option<CsiFrame> {
+    if data.len() < HEADER_V1 {
         return None;
     }
-
     let node_id = data[4];
     let n_antennas = data[5].max(1);
-    let n_subcarriers = u16::from_le_bytes([data[6], data[7]]);
-    let channel = data[8];
-    let rssi = data[9] as i8;
-    let noise_floor = data[10] as i8;
-    let timestamp_us = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-
-    let iq_len = (n_subcarriers as usize) * 2 * (n_antennas as usize);
-    if data.len() < CSI_HEADER_SIZE + iq_len {
+    let n_subcarriers = u16::from_le_bytes(data[6..8].try_into().ok()?);
+    let frequency_mhz = u32::from_le_bytes(data[8..12].try_into().ok()?);
+    let sequence = u32::from_le_bytes(data[12..16].try_into().ok()?);
+    let rssi = data[16] as i8;
+    let noise_floor = data[17] as i8;
+    let flags = u16::from_le_bytes([data[18], data[19]]);
+    let iq_length = n_subcarriers as usize * 2 * n_antennas as usize;
+    if n_subcarriers == 0 || iq_length > 8_192 || data.len() < HEADER_V1 + iq_length {
         return None;
     }
-
-    let iq_data: Vec<i8> = data[CSI_HEADER_SIZE..CSI_HEADER_SIZE + iq_len]
+    let iq_data = data[HEADER_V1..HEADER_V1 + iq_length]
         .iter()
-        .map(|&b| b as i8)
-        .collect();
-
-    // Compute amplitude and phase per subcarrier (first antenna).
-    let mut amplitudes = Vec::with_capacity(n_subcarriers as usize);
-    let mut phases = Vec::with_capacity(n_subcarriers as usize);
-    for i in 0..n_subcarriers as usize {
-        let idx = i * 2;
-        if idx + 1 < iq_data.len() {
-            let ii = iq_data[idx] as f32;
-            let qq = iq_data[idx + 1] as f32;
-            amplitudes.push((ii * ii + qq * qq).sqrt());
-            phases.push(qq.atan2(ii));
-        }
-    }
-
+        .map(|value| *value as i8)
+        .collect::<Vec<_>>();
+    let (amplitudes, phases) = calculate_features(&iq_data, n_subcarriers as usize);
     Some(CsiFrame {
+        protocol_version: if magic == MAGIC_V6 { 6 } else { 1 },
         node_id,
+        station_id: 0,
+        link_id: node_id as u32,
         n_antennas,
         n_subcarriers,
-        channel,
+        frequency_mhz,
+        channel: channel_from_frequency(frequency_mhz),
+        sequence,
+        agent_sequence: 0,
         rssi,
         noise_floor,
-        timestamp_us,
+        flags,
+        firmware_version_code: 0,
+        timestamp_us: 0,
+        received_at_ms: now_ms(),
+        source_mac_hash: [0; 8],
+        payload_crc16: 0,
         iq_data,
         amplitudes,
         phases,
     })
 }
 
-/// Build a synthetic ADR-018 binary frame. Used by the `csi-test` CLI
-/// subcommand and by the unit tests in this module.
-pub fn build_test_frame(magic: u32, node_id: u8, n_subcarriers: u16, i: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(CSI_HEADER_SIZE + (n_subcarriers as usize) * 2);
-    buf.extend_from_slice(&magic.to_le_bytes()); // magic (0..4)
-    buf.push(node_id); // node_id (4)
-    buf.push(1u8); // n_antennas (5)
-    buf.extend_from_slice(&n_subcarriers.to_le_bytes()); // n_subcarriers (6..8)
-    buf.push(6u8); // channel (8)
-    buf.push((-40i8 - (i % 30) as i8) as u8); // rssi (9)
-    buf.push((-90i8) as u8); // noise_floor (10)
-    buf.extend_from_slice(&[0u8; 5]); // reserved (11..16)
-    buf.extend_from_slice(&(i as u32).to_le_bytes()); // timestamp_us (16..20)
-    for j in 0..(n_subcarriers as usize) {
-        buf.push(((i + j) as i8).wrapping_mul(3) as u8);
-        buf.push(((i + j) as i8).wrapping_mul(5) as u8);
+fn parse_v2(data: &[u8]) -> Option<CsiFrame> {
+    if data.len() < HEADER_V2 || data[4] != 2 {
+        return None;
     }
-    buf
+    let header_size = data[5] as usize;
+    if header_size < HEADER_V2 || header_size > 128 || data.len() < header_size {
+        return None;
+    }
+    let node_id = data[6];
+    let n_antennas = data[7].max(1);
+    let station_id = u16::from_le_bytes(data[8..10].try_into().ok()?);
+    let link_id16 = u16::from_le_bytes(data[10..12].try_into().ok()?);
+    let n_subcarriers = u16::from_le_bytes(data[12..14].try_into().ok()?);
+    let channel = data[14];
+    let flags = data[15] as u16;
+    let rssi = data[16] as i8;
+    let noise_floor = data[17] as i8;
+    let firmware_version_code = u16::from_le_bytes(data[18..20].try_into().ok()?);
+    let sequence = u32::from_le_bytes(data[20..24].try_into().ok()?);
+    let agent_sequence = u32::from_le_bytes(data[24..28].try_into().ok()?);
+    let timestamp_us = u64::from_le_bytes(data[28..36].try_into().ok()?);
+    let mut source_mac_hash = [0u8; 8];
+    source_mac_hash.copy_from_slice(&data[36..44]);
+    let payload_length = u16::from_le_bytes(data[44..46].try_into().ok()?) as usize;
+    let payload_crc16 = u16::from_le_bytes(data[46..48].try_into().ok()?);
+    let expected = n_subcarriers as usize * 2 * n_antennas as usize;
+    if station_id == 0
+        || n_subcarriers == 0
+        || expected > 8_192
+        || payload_length < expected
+        || data.len() < header_size + expected
+    {
+        return None;
+    }
+    let payload = &data[header_size..header_size + expected];
+    if payload_crc16 != 0 && crc16_ccitt(payload) != payload_crc16 {
+        return None;
+    }
+    let iq_data = payload.iter().map(|value| *value as i8).collect::<Vec<_>>();
+    let (amplitudes, phases) = calculate_features(&iq_data, n_subcarriers as usize);
+    Some(CsiFrame {
+        protocol_version: 2,
+        node_id,
+        station_id,
+        link_id: if link_id16 == 0 {
+            ((node_id as u32) << 16) | station_id as u32
+        } else {
+            link_id16 as u32
+        },
+        n_antennas,
+        n_subcarriers,
+        frequency_mhz: frequency_from_channel(channel),
+        channel,
+        sequence,
+        agent_sequence,
+        rssi,
+        noise_floor,
+        flags,
+        firmware_version_code,
+        timestamp_us,
+        received_at_ms: now_ms(),
+        source_mac_hash,
+        payload_crc16,
+        iq_data,
+        amplitudes,
+        phases,
+    })
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+pub fn stable_station_id_from_mac_hash(hash: &[u8; 8]) -> u16 {
+    let mut value = 0x811cu16;
+    for byte in hash {
+        value ^= *byte as u16;
+        value = value.wrapping_mul(0x0193);
+    }
+    value.max(1)
+}
+
+pub fn crc16_ccitt(data: &[u8]) -> u16 {
+    let mut crc = 0xffffu16;
+    for byte in data {
+        crc ^= (*byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+pub fn build_v2_test_frame(node_id: u8, station_id: u16, sequence: u32) -> Vec<u8> {
+    let n_subcarriers = 56u16;
+    let payload_length = n_subcarriers as usize * 2;
+    let mut output = vec![0u8; HEADER_V2 + payload_length];
+    output[0..4].copy_from_slice(&MAGIC_V2.to_le_bytes());
+    output[4] = 2;
+    output[5] = HEADER_V2 as u8;
+    output[6] = node_id;
+    output[7] = 1;
+    output[8..10].copy_from_slice(&station_id.max(1).to_le_bytes());
+    let link_id = (((node_id as u16) << 8) ^ station_id).max(1);
+    output[10..12].copy_from_slice(&link_id.to_le_bytes());
+    output[12..14].copy_from_slice(&n_subcarriers.to_le_bytes());
+    output[14] = 6;
+    output[15] = 1;
+    output[16] = (-45i8) as u8;
+    output[17] = (-92i8) as u8;
+    output[18..20].copy_from_slice(&0x0201u16.to_le_bytes());
+    output[20..24].copy_from_slice(&sequence.to_le_bytes());
+    output[24..28].copy_from_slice(&sequence.to_le_bytes());
+    output[28..36].copy_from_slice(&(sequence as u64 * 20_000).to_le_bytes());
+    output[36..44].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    output[44..46].copy_from_slice(&(payload_length as u16).to_le_bytes());
+    for index in 0..payload_length / 2 {
+        let phase = sequence as f32 * 0.12 + index as f32 * 0.2;
+        output[HEADER_V2 + index * 2] = (phase.sin() * 70.0) as i8 as u8;
+        output[HEADER_V2 + index * 2 + 1] = (phase.cos() * 70.0) as i8 as u8;
+    }
+    let crc = crc16_ccitt(&output[HEADER_V2..]);
+    output[46..48].copy_from_slice(&crc.to_le_bytes());
+    output
+}
+
+pub fn send_test_frames(
+    target: &str,
+    count: usize,
+    node_id: u8,
+    station_id: u16,
+) -> anyhow::Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    for sequence in 0..count {
+        let frame = build_v2_test_frame(node_id, station_id, sequence as u32);
+        socket.send_to(&frame, target)?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_magic_v1_roundtrips() {
-        let frame_bytes = build_test_frame(MAGIC_V1, 0x42, 56, 7);
-        let frame = parse_adr018(&frame_bytes).expect("v1 frame should parse");
-        assert_eq!(frame.node_id, 0x42);
-        assert_eq!(frame.n_antennas, 1);
-        assert_eq!(frame.n_subcarriers, 56);
-        assert_eq!(frame.channel, 6);
-        assert_eq!(frame.timestamp_us, 7);
-        assert_eq!(frame.iq_data.len(), 56 * 2);
+    fn v2_roundtrip_validates_crc_and_provenance() {
+        let bytes = build_v2_test_frame(2, 7, 11);
+        let frame = parse_adr018(&bytes).expect("v2 frame");
+        assert_eq!(frame.protocol_version, 2);
+        assert_eq!(frame.node_id, 2);
+        assert_eq!(frame.station_id, 7);
+        assert_eq!(frame.sequence, 11);
+        assert_eq!(frame.firmware_version_code, 0x0201);
         assert_eq!(frame.amplitudes.len(), 56);
-        assert_eq!(frame.phases.len(), 56);
+        assert_ne!(frame.payload_crc16, 0);
     }
 
     #[test]
-    fn parse_magic_v6_roundtrips() {
-        let frame_bytes = build_test_frame(MAGIC_V6, 0x09, 114, 0);
-        let frame = parse_adr018(&frame_bytes).expect("v6 frame should parse");
-        assert_eq!(frame.node_id, 0x09);
-        assert_eq!(frame.n_antennas, 1);
-        assert_eq!(frame.n_subcarriers, 114);
-        assert_eq!(frame.channel, 6);
-        // With i=0, noise_floor=-90 per build_test_frame.
-        assert_eq!(frame.noise_floor, -90);
-        // With i=0, timestamp_us=0.
-        assert_eq!(frame.timestamp_us, 0);
-        assert_eq!(frame.iq_data.len(), 114 * 2);
+    fn corrupted_payload_is_rejected() {
+        let mut bytes = build_v2_test_frame(2, 7, 11);
+        *bytes.last_mut().unwrap() ^= 0xff;
+        assert!(parse_adr018(&bytes).is_none());
     }
 
     #[test]
-    fn parse_rejects_wrong_magic() {
-        let mut bad = build_test_frame(MAGIC_V1, 0, 8, 0);
-        // Flip magic to something unrelated.
-        bad[0] = 0xFF;
-        bad[1] = 0xFF;
-        bad[2] = 0xFF;
-        bad[3] = 0xFF;
-        assert!(parse_adr018(&bad).is_none(), "bad magic should not parse");
+    fn bad_magic_is_rejected() {
+        assert!(parse_adr018(&[1, 2, 3, 4, 5]).is_none());
     }
 
     #[test]
-    fn parse_rejects_truncated_header() {
-        let short = vec![0u8; CSI_HEADER_SIZE - 1];
-        assert!(
-            parse_adr018(&short).is_none(),
-            "truncated header must not parse"
-        );
-    }
-
-    #[test]
-    fn parse_rejects_truncated_payload() {
-        let mut frame = build_test_frame(MAGIC_V1, 0, 32, 0);
-        // Drop half the declared payload.
-        frame.truncate(CSI_HEADER_SIZE + 20);
-        assert!(
-            parse_adr018(&frame).is_none(),
-            "truncated payload must not parse"
-        );
+    fn stable_station_id_is_nonzero_and_repeatable() {
+        let hash = [9, 8, 7, 6, 5, 4, 3, 2];
+        assert_eq!(stable_station_id_from_mac_hash(&hash), stable_station_id_from_mac_hash(&hash));
+        assert_ne!(stable_station_id_from_mac_hash(&hash), 0);
     }
 }

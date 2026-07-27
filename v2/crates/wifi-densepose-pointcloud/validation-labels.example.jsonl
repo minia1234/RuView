@@ -1,0 +1,8 @@
+{"timestamp_ms":1000,"expected_present":false}
+{"timestamp_ms":2000,"expected_present":false}
+{"timestamp_ms":3000,"expected_present":true,"position_m":[2.0,1.7,2.0],"state":"standing"}
+{"timestamp_ms":4000,"expected_present":true,"position_m":[1.0,0.95,2.0],"state":"sitting"}
+{"timestamp_ms":5000,"expected_present":true,"position_m":[2.8,0.30,1.2],"state":"lying"}
+{"timestamp_ms":6000,"event":"link_dropout","link_id":65537}
+{"timestamp_ms":7000,"event":"station_moved","link_id":65537}
+{"timestamp_ms":8000,"event":"furniture_changed"}

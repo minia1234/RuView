@@ -1,8 +1,8 @@
 [package]
 name = "wifi-densepose-pointcloud"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Real-time dense point cloud from camera depth + WiFi CSI tomography"
+description = "WiFi FormMap: real-time station-aware CSI occupancy mapping"
 
 [[bin]]
 name = "ruview-pointcloud"
@@ -17,8 +17,6 @@ axum = { workspace = true }
 tower-http = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
-dirs = "5"
-reqwest = { version = "0.12", features = ["json"], default-features = false }
 
 [dev-dependencies]
 criterion = { workspace = true }
