@@ -1,0 +1,101 @@
+name: FormMap CI
+
+on:
+  pull_request:
+    paths:
+      - "v2/crates/wifi-densepose-pointcloud/**"
+      - "firmware/esp32-csi-node/**"
+      - ".github/workflows/formmap-ci.yml"
+  push:
+    branches:
+      - agent/formmap-build-staging
+    paths:
+      - "v2/crates/wifi-densepose-pointcloud/**"
+      - "firmware/esp32-csi-node/**"
+      - ".github/workflows/formmap-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formmap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust parser / synchronizer / baseline / RTI / replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: v2
+          cache-on-failure: true
+
+      - name: Check FormMap crate
+        working-directory: v2
+        env:
+          GIT_COMMIT_SHA: ${{ github.sha }}
+        run: cargo check -p wifi-densepose-pointcloud --all-targets
+
+      - name: Run FormMap tests
+        working-directory: v2
+        env:
+          GIT_COMMIT_SHA: ${{ github.sha }}
+        run: cargo test -p wifi-densepose-pointcloud
+
+      - name: Print hardware validation contract
+        working-directory: v2
+        run: cargo run -p wifi-densepose-pointcloud -- validation-suite
+
+  esp32-firmware:
+    name: ESP-IDF ${{ matrix.target }} ADR-018 v2
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32s3, esp32c6]
+    container:
+      image: espressif/idf:release-v5.4
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure target
+        working-directory: firmware/esp32-csi-node
+        shell: bash
+        run: |
+          rm -rf build sdkconfig sdkconfig.old
+          if [ -f sdkconfig.defaults.template ]; then
+            cp sdkconfig.defaults.template sdkconfig.defaults
+          fi
+          idf.py set-target "${{ matrix.target }}"
+
+      - name: Build station-aware firmware
+        working-directory: firmware/esp32-csi-node
+        shell: bash
+        env:
+          SDKCONFIG_DEFAULTS: sdkconfig.defaults
+        run: idf.py build
+
+      - name: Verify ADR-018 v2 symbols
+        working-directory: firmware/esp32-csi-node
+        shell: bash
+        run: |
+          grep -R "CSI_MAGIC_V2" main/csi_collector.h
+          grep -R "csi_formmap_station_id" main/csi_collector.c
+          grep -R "csi_formmap_crc16" main/csi_collector.c
